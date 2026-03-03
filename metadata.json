@@ -1,0 +1,5 @@
+{
+  "name": "HLS Stream Proxy Player",
+  "description": "A CORS proxy for HLS streams with a built-in player.",
+  "requestFramePermissions": []
+}
