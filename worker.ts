@@ -2,14 +2,14 @@ export default {
   async fetch(request: Request, env: any, ctx: any): Promise<Response> {
     const url = new URL(request.url);
     
-    // Handle CORS preflight
+    // Handle CORS preflight instantly
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, OPTIONS',
           'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400',
+          'Access-Control-Max-Age': '86400', // Cache preflight for 24 hours
         },
       });
     }
@@ -22,15 +22,39 @@ export default {
 
       try {
         const targetUrl = new URL(targetUrlStr);
-        const headers = new Headers();
         
+        // 1. Check Cloudflare Cache API first for video segments (.ts)
+        const cache = caches.default;
+        const cacheKey = new Request(url.toString(), request);
+        
+        // Only try to serve from cache if it's a video segment (not a playlist)
+        const isLikelySegment = targetUrlStr.endsWith('.ts') || targetUrlStr.endsWith('.m4s') || targetUrlStr.includes('segment');
+        
+        if (isLikelySegment) {
+          const cachedResponse = await cache.match(cacheKey);
+          if (cachedResponse) {
+            // Return instantly from Edge Cache
+            return cachedResponse;
+          }
+        }
+
+        const headers = new Headers();
         // Inject the required headers for the target stream
         headers.set('Referer', 'https://streamindia.co.in/');
         headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        
+        // Request compression from origin to save bandwidth
+        headers.set('Accept-Encoding', 'gzip, br');
 
+        // 2. Fetch from Origin
         const response = await fetch(targetUrl.toString(), {
           headers: headers,
-          redirect: 'follow'
+          redirect: 'follow',
+          // Cloudflare specific optimization: resolve DNS faster
+          cf: {
+            cacheTtl: isLikelySegment ? 31536000 : 0, // Cache segments at Edge for 1 year
+            cacheEverything: isLikelySegment,
+          }
         });
 
         const contentType = response.headers.get('content-type') || '';
@@ -45,6 +69,13 @@ export default {
           // We need to rewrite the playlist content
           let content = await response.text();
           const lines = content.split('\n');
+          
+          // 3. Pre-fetch optimization logic
+          // We will find the first few video segments and trigger background fetches
+          // so they are already cached at the Edge when the player requests them.
+          const segmentsToPrefetch: string[] = [];
+          let prefetchCount = 0;
+
           const rewrittenLines = lines.map(line => {
             const trimmed = line.trim();
             
@@ -52,6 +83,13 @@ export default {
             if (trimmed && !trimmed.startsWith('#')) {
               try {
                 const absoluteUrl = new URL(trimmed, targetUrl.toString()).href;
+                
+                // Add to prefetch list if it's a video segment (max 3 to avoid overloading)
+                if (prefetchCount < 3 && (absoluteUrl.endsWith('.ts') || absoluteUrl.endsWith('.m4s'))) {
+                  segmentsToPrefetch.push(absoluteUrl);
+                  prefetchCount++;
+                }
+                
                 return `${url.origin}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
               } catch (e) {
                 return line;
@@ -73,7 +111,25 @@ export default {
             return line;
           });
           
-          // Playlists should not be cached
+          // 4. Execute background pre-fetching (non-blocking)
+          if (segmentsToPrefetch.length > 0) {
+            ctx.waitUntil(
+              Promise.allSettled(
+                segmentsToPrefetch.map(segUrl => {
+                  // Fire and forget request to cache it at the edge
+                  return fetch(segUrl, {
+                    headers: {
+                      'Referer': 'https://streamindia.co.in/',
+                      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    },
+                    cf: { cacheTtl: 31536000, cacheEverything: true }
+                  }).catch(() => {}); // Ignore errors in background
+                })
+              )
+            );
+          }
+          
+          // Playlists should not be cached by the browser
           newHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
           
           return new Response(rewrittenLines.join('\n'), {
@@ -82,13 +138,20 @@ export default {
           });
         } else {
           // For video segments (.ts), we stream the body directly for performance
-          // and set aggressive caching headers
+          // and set aggressive caching headers for the browser
           newHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
           
-          return new Response(response.body, {
+          const finalResponse = new Response(response.body, {
             status: response.status,
             headers: newHeaders
           });
+          
+          // 5. Put in Cloudflare Cache API for future requests from ANY user
+          if (response.status === 200) {
+            ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+          }
+          
+          return finalResponse;
         }
       } catch (e: any) {
         return new Response(`Proxy error: ${e.message}`, { 
